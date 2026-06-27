@@ -6,7 +6,6 @@ import { readFile, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GUIDE_LANGUAGES } from "../../../lib/audioguide";
-import { AUDIO_ARCHIVE_DIR, getArchivedAudio, saveArchivedAudio, safeAudioFileName } from "../../../lib/server/archive";
 
 export const runtime = "nodejs";
 export const maxDuration = 120;
@@ -55,9 +54,24 @@ function encodeMp3(buffers: Buffer[]) {
   return Buffer.concat(output);
 }
 
-function audioBlob(buffer: Buffer) {
-  const arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength) as ArrayBuffer;
-  return new Blob([arrayBuffer], { type: "audio/mpeg" });
+function mp3Response(buffer: Buffer, fileName: string, repairedSegments: number) {
+  const safeName = fileName.replace(/[^\w.\- ]+/g, "_").replace(/[\r\n"]/g, "_").slice(0, 180) || "voce.mp3";
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (let offset = 0; offset < buffer.byteLength; offset += 64 * 1024) {
+        controller.enqueue(new Uint8Array(buffer.subarray(offset, offset + 64 * 1024)));
+      }
+      controller.close();
+    },
+  });
+  return new NextResponse(stream, {
+    headers: {
+      "Content-Type": "audio/mpeg",
+      "Content-Disposition": `attachment; filename="${safeName}"`,
+      "Cache-Control": "private, no-store",
+      "X-Voce-Repaired-Segments": String(repairedSegments),
+    },
+  });
 }
 
 async function synthesizeFallback(text: string, voice: string, style: string, language: string) {
@@ -187,10 +201,9 @@ async function buildBatchMp3(outputFile: string, fallback?: BatchFallback): Prom
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    if (body.action === "save") {
+    if (body.action === "result") {
       const name = typeof body.name === "string" ? body.name : "";
-      const fileName = safeAudioFileName(typeof body.fileName === "string" ? body.fileName : `${name.replace(/[^\w.-]+/g, "_")}.mp3`);
-      const outputSubdir = typeof body.outputSubdir === "string" ? body.outputSubdir : "";
+      const fileName = typeof body.fileName === "string" ? body.fileName : `${name.replace(/[^\w.-]+/g, "_")}.mp3`;
       const voice = VALID_VOICES.has(body.voice) ? body.voice : "Kore";
       const language = typeof body.language === "string" ? body.language : "";
       const style = typeof body.style === "string" ? body.style.trim().slice(0, 500) : "Leggi in modo naturale e chiaro.";
@@ -209,14 +222,7 @@ export async function POST(request: NextRequest) {
       const outputFile = job.dest?.fileName;
       if (!outputFile) return NextResponse.json({ error: "Il job non contiene un file di risultati." }, { status: 502 });
       const result = await buildBatchMp3(outputFile, { chunks, voice, style, language });
-      const saved = await saveArchivedAudio(fileName, result.mp3, outputSubdir);
-      return NextResponse.json({
-        saved: true,
-        outputDir: AUDIO_ARCHIVE_DIR,
-        warnings: result.warnings,
-        repairedSegments: result.repairedSegments,
-        ...saved,
-      });
+      return mp3Response(result.mp3, fileName, result.repairedSegments);
     }
 
     const displayName = typeof body.displayName === "string" ? body.displayName.slice(0, 120) : "Audioguida";
@@ -278,13 +284,11 @@ export async function GET(request: NextRequest) {
   try {
     const name = request.nextUrl.searchParams.get("name");
     const download = request.nextUrl.searchParams.get("download") === "1";
-    const save = request.nextUrl.searchParams.get("save") === "1";
-    const fileName = safeAudioFileName(request.nextUrl.searchParams.get("fileName") || `${name?.replace(/[^\w.-]+/g, "_")}.mp3`);
-    const outputSubdir = request.nextUrl.searchParams.get("outputSubdir") || "";
+    const fileName = request.nextUrl.searchParams.get("fileName") || `${name?.replace(/[^\w.-]+/g, "_")}.mp3`;
     if (!name?.startsWith("batches/")) return NextResponse.json({ error: "Job Batch non valido." }, { status: 400 });
     const job = await client().batches.get({ name });
 
-    if (!download && !save) {
+    if (!download) {
       return NextResponse.json({
         name: job.name,
         state: job.state,
@@ -298,50 +302,10 @@ export async function GET(request: NextRequest) {
     if (job.state !== "JOB_STATE_SUCCEEDED") {
       return NextResponse.json({ error: "Il job non è ancora completato.", state: job.state }, { status: 409 });
     }
-    if (save || download) {
-      const archived = await getArchivedAudio(fileName, outputSubdir);
-      if (archived) {
-        if (save) {
-          return NextResponse.json({
-            saved: true,
-            fileName,
-            path: archived.path,
-            outputDir: AUDIO_ARCHIVE_DIR,
-            size: archived.size,
-            savedAt: archived.savedAt,
-          });
-        }
-        return new NextResponse(audioBlob(archived.audio), {
-          headers: {
-            "Content-Type": "audio/mpeg",
-            "Content-Length": String(archived.audio.byteLength),
-            "Cache-Control": "private, no-store",
-          },
-        });
-      }
-    }
-
     const outputFile = job.dest?.fileName;
     if (!outputFile) return NextResponse.json({ error: "Il job non contiene un file di risultati." }, { status: 502 });
     const result = await buildBatchMp3(outputFile);
-    if (save) {
-      const saved = await saveArchivedAudio(fileName, result.mp3, outputSubdir);
-      return NextResponse.json({
-        saved: true,
-        outputDir: AUDIO_ARCHIVE_DIR,
-        warnings: result.warnings,
-        repairedSegments: result.repairedSegments,
-        ...saved,
-      });
-    }
-    return new NextResponse(audioBlob(result.mp3), {
-      headers: {
-        "Content-Type": "audio/mpeg",
-        "Content-Length": String(result.mp3.byteLength),
-        "Cache-Control": "private, no-store",
-        "X-Voce-Repaired-Segments": String(result.repairedSegments),
-      },
-    });
+    return mp3Response(result.mp3, fileName, result.repairedSegments);
   } catch (error) {
     console.error("Batch get error", error);
     return NextResponse.json({ error: (error as Error).message || "Impossibile recuperare il job Batch." }, { status: 502 });

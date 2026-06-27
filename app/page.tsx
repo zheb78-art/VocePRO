@@ -68,11 +68,80 @@ type FolderBatchTask = {
   chunks: string[];
 };
 
+type OutputWritable = {
+  write(data: Blob): Promise<void>;
+  close(): Promise<void>;
+};
+
+type OutputFileHandle = {
+  createWritable(): Promise<OutputWritable>;
+};
+
+type OutputDirectoryHandle = {
+  kind: "directory";
+  name: string;
+  getDirectoryHandle(name: string, options: { create: boolean }): Promise<OutputDirectoryHandle>;
+  getFileHandle(name: string, options: { create: boolean }): Promise<OutputFileHandle>;
+  queryPermission?(options: { mode: "readwrite" }): Promise<PermissionState>;
+  requestPermission?(options: { mode: "readwrite" }): Promise<PermissionState>;
+};
+
+type DirectoryPickerWindow = Window & {
+  showDirectoryPicker?: (options: { id: string; mode: "readwrite" }) => Promise<OutputDirectoryHandle>;
+};
+
 const BATCH_STORAGE_KEY = "voce-gemini-batch-jobs-v1";
+const OUTPUT_DIRECTORY_DB = "voce-output-directory";
 const BATCH_TERMINAL_STATES = new Set(["JOB_STATE_SUCCEEDED", "JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"]);
 
 function timestampFilePart() {
   return new Date().toISOString().slice(0, 19).replace("T", "_").replace(/:/g, "-");
+}
+
+function openOutputDirectoryDb() {
+  return new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open(OUTPUT_DIRECTORY_DB, 1);
+    request.onupgradeneeded = () => request.result.createObjectStore("handles");
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function rememberOutputDirectory(handle: OutputDirectoryHandle) {
+  const db = await openOutputDirectoryDb();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction("handles", "readwrite");
+    transaction.objectStore("handles").put(handle, "output");
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+  db.close();
+}
+
+async function restoreOutputDirectory() {
+  const db = await openOutputDirectoryDb();
+  const handle = await new Promise<OutputDirectoryHandle | undefined>((resolve, reject) => {
+    const request = db.transaction("handles").objectStore("handles").get("output");
+    request.onsuccess = () => resolve(request.result as OutputDirectoryHandle | undefined);
+    request.onerror = () => reject(request.error);
+  });
+  db.close();
+  return handle;
+}
+
+function safeLocalFileName(value: string) {
+  return value.replace(/[\\/:*?"<>|]+/g, "_").replace(/\s+/g, "_").slice(0, 180) || `voce_${timestampFilePart()}.mp3`;
+}
+
+function browserDownload(blob: Blob, fileName: string) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = safeLocalFileName(fileName);
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 30000);
 }
 
 function batchStateLabel(state: string) {
@@ -207,6 +276,8 @@ export default function Home() {
   const [batchDownloading, setBatchDownloading] = useState("");
   const [autoCleanBatch, setAutoCleanBatch] = useState(true);
   const [folderWorkflowSummary, setFolderWorkflowSummary] = useState("");
+  const [outputDirectoryName, setOutputDirectoryName] = useState("");
+  const [directorySavingSupported, setDirectorySavingSupported] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const resumeRef = useRef<{ key: string; buffers: ArrayBuffer[] }>({ key: "", buffers: [] });
   const resultUrlsRef = useRef<string[]>([]);
@@ -217,6 +288,7 @@ export default function Home() {
   const pendingBatchSavesRef = useRef<LocalBatchJob[]>([]);
   const savingBatchQueueRef = useRef(false);
   const batchCleanupTimerRef = useRef<number | null>(null);
+  const outputDirectoryRef = useRef<OutputDirectoryHandle | null>(null);
   const narrationCleanup = useMemo(() => mode === "guide" ? stripParagraphTitles(text) : { text, removedTitles: [] }, [mode, text]);
   const chunks = useMemo(() => splitText(narrationCleanup.text), [narrationCleanup.text]);
   const commonGuideLanguages = useMemo(() => GUIDE_LANGUAGES.filter((language) =>
@@ -242,9 +314,27 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    const supported = typeof window !== "undefined" && Boolean((window as DirectoryPickerWindow).showDirectoryPicker);
+    setDirectorySavingSupported(supported);
+    if (!supported) return;
+    restoreOutputDirectory()
+      .then(async (handle) => {
+        if (!handle) return;
+        outputDirectoryRef.current = handle;
+        setOutputDirectoryName(handle.name);
+      })
+      .catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
     batchJobsRef.current = batchJobs;
     if (batchHydrated) window.localStorage.setItem(BATCH_STORAGE_KEY, JSON.stringify(batchJobs));
   }, [batchJobs, batchHydrated]);
+
+  useEffect(() => {
+    if (!batchHydrated || !outputDirectoryName) return;
+    enqueueBatchSaves(batchJobsRef.current.filter((job) => job.state === "JOB_STATE_SUCCEEDED" && !job.savedAt));
+  }, [batchHydrated, outputDirectoryName]);
 
   useEffect(() => {
     if (!batchHydrated || !autoCleanBatch || !batchJobs.length || status === "working") return;
@@ -266,7 +356,6 @@ export default function Home() {
   useEffect(() => {
     if (!batchHydrated) return;
     refreshBatchJobs();
-    enqueueBatchSaves(batchJobsRef.current.filter((job) => job.state === "JOB_STATE_SUCCEEDED" && !job.savedAt && !job.saveError));
     const timer = window.setInterval(refreshBatchJobs, 30000);
     return () => window.clearInterval(timer);
   }, [batchHydrated]);
@@ -291,7 +380,7 @@ export default function Home() {
     clearGuideResults();
   }
 
-  function clearBatchInterface(nextMessage = "Interfaccia pulita. Gli MP3 salvati restano nella cartella generated-mp3.") {
+  function clearBatchInterface(nextMessage = "Interfaccia pulita. Gli MP3 salvati restano nella cartella scelta sul computer.") {
     if (batchCleanupTimerRef.current) {
       window.clearTimeout(batchCleanupTimerRef.current);
       batchCleanupTimerRef.current = null;
@@ -312,6 +401,43 @@ export default function Home() {
     setProgress(0);
     setStatus("ready");
     setMessage(nextMessage);
+  }
+
+  async function chooseOutputDirectory() {
+    try {
+      let handle = outputDirectoryRef.current;
+      if (handle?.requestPermission) {
+        const permission = await handle.requestPermission({ mode: "readwrite" });
+        if (permission !== "granted") handle = null;
+      }
+      if (!handle) {
+        const picker = (window as DirectoryPickerWindow).showDirectoryPicker;
+        if (!picker) {
+          setMessage("Questo browser userà la cartella Download. Chrome o Edge permettono di scegliere una cartella specifica.");
+          setStatus("ready");
+          return;
+        }
+        handle = await picker({ id: "voce-mp3-output", mode: "readwrite" });
+      }
+      outputDirectoryRef.current = handle;
+      setOutputDirectoryName(handle.name);
+      await rememberOutputDirectory(handle).catch(() => undefined);
+      setBatchJobs((current) => current.map((job) => job.state === "JOB_STATE_SUCCEEDED" && !job.savedAt ? { ...job, saveError: undefined } : job));
+      const ready = batchJobsRef.current.filter((job) => job.state === "JOB_STATE_SUCCEEDED" && !job.savedAt);
+      setMessage(`Cartella “${handle.name}” pronta. Salvo automaticamente gli MP3 completati.`);
+      setStatus("ready");
+      enqueueBatchSaves(ready);
+    } catch (error) {
+      if ((error as Error).name !== "AbortError") {
+        setMessage(`Non posso usare la cartella scelta: ${(error as Error).message}`);
+        setStatus("error");
+      }
+    }
+  }
+
+  async function logout() {
+    await fetch("/api/auth/logout", { method: "POST" }).catch(() => undefined);
+    window.location.assign("/login");
   }
 
   function changeMode(nextMode: "text" | "guide") {
@@ -418,7 +544,7 @@ export default function Home() {
           const data = await response.json();
           if (!response.ok) throw new Error(data.error || "Stato non disponibile");
           const updated = { ...job, state: data.state ?? job.state, error: data.error || undefined };
-          if (updated.state === "JOB_STATE_SUCCEEDED" && !updated.savedAt && !updated.saveError) jobsToSave.push(updated);
+          if (updated.state === "JOB_STATE_SUCCEEDED" && !updated.savedAt && !updated.saveError && outputDirectoryRef.current) jobsToSave.push(updated);
           return updated;
         } catch (error) {
           return { ...job, error: (error as Error).message };
@@ -432,43 +558,70 @@ export default function Home() {
     }
   }
 
-  async function saveBlobToArchive(blob: Blob, fileName: string, outputSubdir = "") {
-    const form = new FormData();
-    form.append("fileName", fileName);
-    form.append("outputSubdir", outputSubdir);
-    form.append("file", blob, fileName);
-    const response = await fetch("/api/archive", { method: "POST", body: form });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error || "Salvataggio automatico non riuscito.");
-    return data as { savedAt?: string; path?: string };
+  async function saveBlobToComputer(blob: Blob, fileName: string, outputSubdir = "") {
+    const pickerSupported = Boolean((window as DirectoryPickerWindow).showDirectoryPicker);
+    if (!pickerSupported) {
+      browserDownload(blob, fileName);
+      return { savedAt: new Date().toISOString(), path: `Download/${safeLocalFileName(fileName)}` };
+    }
+
+    const root = outputDirectoryRef.current;
+    if (!root) throw new Error("Seleziona prima la cartella di salvataggio in alto.");
+    if (root.queryPermission && await root.queryPermission({ mode: "readwrite" }) !== "granted") {
+      throw new Error("Il browser richiede di autorizzare nuovamente la cartella di salvataggio.");
+    }
+    let directory = root;
+    const parts = outputSubdir.split(/[\\/]+/).map((part) => safeLocalFileName(part).replace(/\.mp3$/i, "")).filter(Boolean);
+    for (const part of parts) directory = await directory.getDirectoryHandle(part, { create: true });
+    const safeName = safeLocalFileName(fileName);
+    const file = await directory.getFileHandle(safeName, { create: true });
+    const writable = await file.createWritable();
+    await writable.write(blob);
+    await writable.close();
+    return {
+      savedAt: new Date().toISOString(),
+      path: [root.name, ...parts, safeName].join("/"),
+    };
+  }
+
+  async function fetchBatchResult(job: LocalBatchJob) {
+    const response = job.chunks?.length
+      ? await fetch("/api/batch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "result",
+            name: job.name,
+            fileName: job.fileName,
+            voice: job.voice,
+            language: job.language,
+            style: job.style,
+            chunks: job.chunks,
+          }),
+        })
+      : await fetch(`/api/batch?name=${encodeURIComponent(job.name)}&download=1&fileName=${encodeURIComponent(job.fileName)}`);
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.error || "Preparazione MP3 non riuscita.");
+    }
+    return {
+      blob: await response.blob(),
+      repairedSegments: Number(response.headers.get("X-Voce-Repaired-Segments") || 0),
+    };
   }
 
   async function saveBatchResult(job: LocalBatchJob) {
     if (savingBatchRef.current.has(job.localId)) return false;
     savingBatchRef.current.add(job.localId);
     try {
-      const response = await fetch("/api/batch", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "save",
-          name: job.name,
-          fileName: job.fileName,
-          voice: job.voice,
-          language: job.language,
-          style: job.style,
-          chunks: job.chunks,
-          outputSubdir: job.outputSubdir,
-        }),
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "Salvataggio automatico non riuscito.");
+      const result = await fetchBatchResult(job);
+      const saved = await saveBlobToComputer(result.blob, job.fileName, job.outputSubdir);
       setBatchJobs((current) => current.map((item) => item.localId === job.localId ? {
         ...item,
-        savedAt: data.savedAt ?? new Date().toISOString(),
-        savedPath: data.path,
+        savedAt: saved.savedAt,
+        savedPath: saved.path,
         saveError: undefined,
-        saveWarning: data.repairedSegments ? `${data.repairedSegments} ${data.repairedSegments === 1 ? "segmento rigenerato" : "segmenti rigenerati"} perché Gemini non aveva restituito audio.` : undefined,
+        saveWarning: result.repairedSegments ? `${result.repairedSegments} ${result.repairedSegments === 1 ? "segmento rigenerato" : "segmenti rigenerati"} perché Gemini non aveva restituito audio.` : undefined,
       } : item));
       return true;
     } catch (error) {
@@ -685,7 +838,7 @@ export default function Home() {
       }
 
       setStatus("ready");
-      setMessage(`${submitted} job inviati${skipped ? `, ${skipped} già presenti` : ""}. Gli MP3 saranno salvati in generated-mp3/{lingua}.`);
+      setMessage(`${submitted} job inviati${skipped ? `, ${skipped} già presenti` : ""}. Gli MP3 saranno salvati nella cartella scelta, divisi per lingua.`);
       if (errors.length) setGuideError(errors.slice(0, 6).join(" · ") + (errors.length > 6 ? ` · altri ${errors.length - 6} avvisi` : ""));
     } catch (error) {
       if ((error as Error).name === "AbortError") {
@@ -766,23 +919,20 @@ export default function Home() {
   async function downloadBatchResult(job: LocalBatchJob) {
     setBatchDownloading(job.localId);
     try {
-      if (job.chunks?.length) {
+      if (outputDirectoryRef.current || !(window as DirectoryPickerWindow).showDirectoryPicker) {
         const saved = await saveBatchResult(job);
-        if (!saved) throw new Error("Prima devo ricreare un MP3 completo: il salvataggio automatico non è riuscito.");
+        if (!saved) throw new Error("Salvataggio non riuscito.");
+      } else {
+        const result = await fetchBatchResult(job);
+        browserDownload(result.blob, job.fileName);
+        setBatchJobs((current) => current.map((item) => item.localId === job.localId ? {
+          ...item,
+          savedAt: new Date().toISOString(),
+          savedPath: `Download/${job.fileName}`,
+          saveError: undefined,
+          saveWarning: result.repairedSegments ? `${result.repairedSegments} ${result.repairedSegments === 1 ? "segmento rigenerato" : "segmenti rigenerati"} perché Gemini non aveva restituito audio.` : undefined,
+        } : item));
       }
-      const response = await fetch(`/api/batch?name=${encodeURIComponent(job.name)}&download=1&fileName=${encodeURIComponent(job.fileName)}&outputSubdir=${encodeURIComponent(job.outputSubdir ?? "")}`);
-      if (!response.ok) {
-        const data = await response.json().catch(() => ({}));
-        throw new Error(data.error || "Download non riuscito.");
-      }
-      const url = URL.createObjectURL(await response.blob());
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = job.fileName;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.setTimeout(() => URL.revokeObjectURL(url), 30000);
     } catch (error) {
       setMessage((error as Error).message);
       setStatus("error");
@@ -836,7 +986,7 @@ export default function Home() {
       const mp3 = encodeMp3(pcmParts);
       const url = URL.createObjectURL(mp3);
       setAudioUrl(url);
-      saveBlobToArchive(mp3, "voce.mp3")
+      saveBlobToComputer(mp3, "voce.mp3")
         .then((saved) => setMessage(`Il tuo audio è pronto e salvato in automatico${saved.path ? `: ${saved.path}` : ""}`))
         .catch((error) => setMessage(`Il tuo audio è pronto, ma il salvataggio automatico non è riuscito: ${(error as Error).message}`));
       setProgress(100);
@@ -911,7 +1061,7 @@ export default function Home() {
           url,
         };
         setGuideResults((current) => [...current.filter((item) => item.id !== result.id), result]);
-        saveBlobToArchive(mp3, fileName, suffix)
+        saveBlobToComputer(mp3, fileName, suffix)
           .then((saved) => setGuideResults((current) => current.map((item) => item.id === result.id ? { ...item, savedAt: saved.savedAt ?? new Date().toISOString(), saveError: undefined } : item)))
           .catch((error) => setGuideResults((current) => current.map((item) => item.id === result.id ? { ...item, saveError: (error as Error).message } : item)));
         resumeRef.current = { key: "", buffers: [] };
@@ -951,7 +1101,16 @@ export default function Home() {
 
   return (
     <main>
-      <nav><div className="brand"><span className="mark">V</span> Voce</div><span className="badge">Gemini TTS</span></nav>
+      <nav>
+        <div className="brand"><span className="mark">V</span> Voce</div>
+        <div className="navActions">
+          <button type="button" className={`outputDirectory ${outputDirectoryName ? "ready" : ""}`} onClick={chooseOutputDirectory}>
+            {directorySavingSupported ? outputDirectoryName ? `Cartella: ${outputDirectoryName}` : "Scegli cartella MP3" : "Download del browser"}
+          </button>
+          <span className="badge">Gemini TTS</span>
+          <button type="button" className="logoutButton" onClick={logout}>Esci</button>
+        </div>
+      </nav>
       <section className="hero">
         <p className="eyebrow">IL TESTO PRENDE VOCE</p>
         <h1>Da parole scritte<br />a <em>storie da ascoltare.</em></h1>
@@ -1002,7 +1161,7 @@ export default function Home() {
 
       {batchHydrated && batchJobs.length > 0 && <section className="batchJobsPanel">
         <div className="batchJobsHeader">
-          <div><span className="batchEyebrow">LAVORI PERSISTENTI</span><h2>Job Batch</h2><p>Continuano sui server Google anche quando questa pagina o il computer sono spenti.</p></div>
+          <div><span className="batchEyebrow">LAVORI PERSISTENTI</span><h2>Job Batch</h2><p>Continuano su Google; gli MP3 pronti vengono salvati nella cartella scelta sul computer.</p></div>
           <div className="batchHeaderActions">
             <label className="batchAutoClean"><input type="checkbox" checked={autoCleanBatch} onChange={(event) => setAutoCleanBatch(event.target.checked)} /> Pulisci alla fine</label>
             <button type="button" onClick={refreshBatchJobs}>Aggiorna stato ↻</button>
@@ -1016,14 +1175,14 @@ export default function Home() {
               <span className="batchJobName">
                 <strong>{job.fileName}</strong>
                 <small>Voce {job.voice}{job.outputSubdir ? ` · cartella ${job.outputSubdir}` : ""} · {new Date(job.createdAt).toLocaleString("it-IT")}</small>
-                {job.savedAt && <small className="savedMeta">Salvato automaticamente · {new Date(job.savedAt).toLocaleString("it-IT")}</small>}
+                {job.savedAt && <small className="savedMeta">Salvato sul computer · {new Date(job.savedAt).toLocaleString("it-IT")}</small>}
                 {job.saveWarning && <small className="saveWarning">{job.saveWarning}</small>}
                 {job.saveError && <small className="saveError">Salvataggio automatico non riuscito: {job.saveError}</small>}
               </span>
             </div>
             {job.error && <span className="batchJobError">{job.error}</span>}
             <div className="batchJobActions">
-              {job.state === "JOB_STATE_SUCCEEDED" && <button type="button" className="batchDownload" onClick={() => downloadBatchResult(job)} disabled={batchDownloading === job.localId}>{batchDownloading === job.localId ? "Preparo MP3…" : "Scarica MP3 ↓"}</button>}
+              {job.state === "JOB_STATE_SUCCEEDED" && <button type="button" className="batchDownload" onClick={() => downloadBatchResult(job)} disabled={batchDownloading === job.localId}>{batchDownloading === job.localId ? "Preparo MP3…" : job.savedAt ? "Salva di nuovo ↓" : "Salva MP3 ↓"}</button>}
               {job.state === "JOB_STATE_SUCCEEDED" && (job.saveError || job.saveWarning) && <button type="button" className="batchCancel" onClick={() => saveBatchResult(job)}>{job.saveWarning ? "Ricrea completo" : "Riprova salvataggio"}</button>}
               <button type="button" className="batchCancel" onClick={() => cancelBatchJob(job)}>{BATCH_TERMINAL_STATES.has(job.state) ? "Rimuovi" : "Annulla"}</button>
             </div>
