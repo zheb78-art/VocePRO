@@ -35,6 +35,21 @@ h1 em { font-family:"Playfair Display",serif; font-weight:600; color:var(--rust)
 .fileButton.secondary:hover { background:var(--paper); }
 .fileStatus,.guideError { grid-column:1/-1; border-top:1px solid rgba(23,23,20,.2); padding-top:12px; }
 .guideError { color:#8f291b; font-weight:600; }
+.folderLanguagePicker { grid-column:1/-1; border:1px solid var(--ink); background:var(--paper); padding:16px; }
+.folderLanguageHeader,.folderLanguageFooter { display:flex; align-items:center; justify-content:space-between; gap:18px; }
+.folderLanguageHeader>div:first-child { display:flex; flex-direction:column; gap:3px; }
+.folderLanguageHeader strong { font-size:13px; }
+.folderLanguageHeader span,.folderLanguageFooter>span { color:#6b685f; font-size:10px; }
+.folderLanguageHeader>div:last-child { display:flex; gap:6px; }
+.folderLanguageHeader button { border:1px solid var(--line); background:transparent; padding:6px 9px; cursor:pointer; font-size:9px; }
+.folderLanguageGrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:7px; margin:14px 0; }
+.folderLanguageGrid label { display:flex; align-items:center; gap:8px; border:1px solid var(--line); padding:9px 10px; cursor:pointer; font-size:11px; }
+.folderLanguageGrid label.selected { border-color:var(--ink); background:var(--ink); color:white; }
+.folderLanguageGrid input { width:auto; margin:0; accent-color:var(--rust); }
+.folderLanguageGrid span { display:flex; justify-content:space-between; align-items:center; flex:1; gap:6px; }
+.folderLanguageGrid small { opacity:.65; font-size:9px; }
+.startFolderBatch { border:0; background:var(--rust); color:white; padding:11px 14px; cursor:pointer; font-size:11px; font-weight:600; }
+.startFolderBatch:disabled { opacity:.35; cursor:not-allowed; }
 .queue { grid-column:1/-1; border-top:1px solid rgba(23,23,20,.24); padding-top:14px; }
 .queueHeader { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; font-size:12px; }
 .queueHeader span { color:#646157; }
@@ -146,6 +161,11 @@ footer { display:flex; justify-content:space-between; padding:32px 0; color:#777
   .guideActions { margin-top:18px; flex-direction:column; align-items:stretch; }
   .fileButton { text-align:center; }
   .fileStatus,.guideError { margin-top:14px; }
+  .folderLanguagePicker { margin-top:14px; }
+  .folderLanguageHeader,.folderLanguageFooter { align-items:stretch; flex-direction:column; }
+  .folderLanguageHeader>div:last-child { align-self:flex-start; }
+  .folderLanguageGrid { grid-template-columns:1fr 1fr; }
+  .startFolderBatch { width:100%; }
   .queue { margin-top:18px; }
   .queuePreview { grid-template-columns:28px minmax(0,1fr); }
   .queueVoice { display:none; }

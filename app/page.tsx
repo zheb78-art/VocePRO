@@ -276,6 +276,8 @@ export default function Home() {
   const [batchDownloading, setBatchDownloading] = useState("");
   const [autoCleanBatch, setAutoCleanBatch] = useState(true);
   const [folderWorkflowSummary, setFolderWorkflowSummary] = useState("");
+  const [folderAvailableLanguages, setFolderAvailableLanguages] = useState<string[]>([]);
+  const [folderSelectedLanguages, setFolderSelectedLanguages] = useState<string[]>([]);
   const [outputDirectoryName, setOutputDirectoryName] = useState("");
   const [directorySavingSupported, setDirectorySavingSupported] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
@@ -288,6 +290,7 @@ export default function Home() {
   const pendingBatchSavesRef = useRef<LocalBatchJob[]>([]);
   const savingBatchQueueRef = useRef(false);
   const batchCleanupTimerRef = useRef<number | null>(null);
+  const folderTasksRef = useRef<FolderBatchTask[]>([]);
   const outputDirectoryRef = useRef<OutputDirectoryHandle | null>(null);
   const narrationCleanup = useMemo(() => mode === "guide" ? stripParagraphTitles(text) : { text, removedTitles: [] }, [mode, text]);
   const chunks = useMemo(() => splitText(narrationCleanup.text), [narrationCleanup.text]);
@@ -295,6 +298,10 @@ export default function Home() {
     guideFiles.length > 0 && guideFiles.every((file) => file.sections.some((section) => section.id === language.id)),
   ), [guideFiles]);
   const activeGuide = useMemo(() => guideFiles.find((file) => file.id === activeGuideId), [guideFiles, activeGuideId]);
+  const selectedFolderTaskCount = useMemo(() => {
+    const selected = new Set(folderSelectedLanguages);
+    return folderTasksRef.current.filter((task) => selected.has(task.languageId)).length;
+  }, [folderAvailableLanguages, folderSelectedLanguages]);
 
   useEffect(() => () => {
     if (audioUrl) URL.revokeObjectURL(audioUrl);
@@ -337,7 +344,7 @@ export default function Home() {
   }, [batchHydrated, outputDirectoryName]);
 
   useEffect(() => {
-    if (!batchHydrated || !autoCleanBatch || !batchJobs.length || status === "working") return;
+    if (!batchHydrated || !autoCleanBatch || !batchJobs.length || status === "working" || folderAvailableLanguages.length) return;
     const allSucceededAndSaved = batchJobs.every((job) => job.state === "JOB_STATE_SUCCEEDED" && job.savedAt);
     if (!allSucceededAndSaved || savingBatchQueueRef.current || savingBatchRef.current.size) return;
     if (batchCleanupTimerRef.current) window.clearTimeout(batchCleanupTimerRef.current);
@@ -351,7 +358,7 @@ export default function Home() {
         batchCleanupTimerRef.current = null;
       }
     };
-  }, [batchJobs, batchHydrated, autoCleanBatch, status]);
+  }, [batchJobs, batchHydrated, autoCleanBatch, status, folderAvailableLanguages.length]);
 
   useEffect(() => {
     if (!batchHydrated) return;
@@ -386,7 +393,10 @@ export default function Home() {
       batchCleanupTimerRef.current = null;
     }
     pendingBatchSavesRef.current = [];
+    folderTasksRef.current = [];
     setFolderWorkflowSummary("");
+    setFolderAvailableLanguages([]);
+    setFolderSelectedLanguages([]);
     setBatchDownloading("");
     setBatchJobs([]);
     setGuideFiles([]);
@@ -728,7 +738,13 @@ export default function Home() {
     }
   }
 
-  async function submitFolderWorkflow(files: FileList | null) {
+  function toggleFolderLanguage(languageId: string) {
+    setFolderSelectedLanguages((current) =>
+      current.includes(languageId) ? current.filter((id) => id !== languageId) : [...current, languageId],
+    );
+  }
+
+  async function prepareFolderWorkflow(files: FileList | null) {
     if (!files?.length) return;
     setMode("guide");
     setGenerationMethod("batch");
@@ -737,16 +753,18 @@ export default function Home() {
     setMessage("Leggo la cartella…");
     setGuideError("");
     setFolderWorkflowSummary("");
+    setFolderAvailableLanguages([]);
+    setFolderSelectedLanguages([]);
+    folderTasksRef.current = [];
     const controller = new AbortController();
     abortRef.current = controller;
-    const jobStyle = customStyle.trim() || style;
-    const firstVoiceIndex = Math.max(0, VOICES.findIndex(([name]) => name === voice));
     const tasks: FolderBatchTask[] = [];
     const errors: string[] = [];
     const txtFiles = Array.from(files).filter((file) => file.name.toLocaleLowerCase().endsWith(".txt"));
 
     try {
       for (const file of txtFiles) {
+        if (controller.signal.aborted) throw new DOMException("Operazione annullata", "AbortError");
         const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
         if (file.size > 5 * 1024 * 1024) {
           errors.push(`${relativePath}: supera 5 MB`);
@@ -770,13 +788,12 @@ export default function Home() {
             errors.push(`${relativePath} · ${language.label}: testo vuoto dopo la pulizia`);
             continue;
           }
-          const assignedVoice = VOICES[(firstVoiceIndex + tasks.length) % VOICES.length][0];
           tasks.push({
             sourceId: `${relativePath}-${file.size}-${file.lastModified}-${section.id}`,
             sourceName: relativePath,
             languageId: section.id,
             suffix: language.suffix,
-            voice: assignedVoice,
+            voice: VOICES[0][0],
             fileName: `${baseName}_${language.suffix}.mp3`,
             outputSubdir: language.suffix,
             chunks: taskChunks,
@@ -785,10 +802,50 @@ export default function Home() {
       }
 
       if (!tasks.length) throw new Error(errors.join(" · ") || "Nessun file TXT valido trovato nella cartella.");
-      setFolderWorkflowSummary(`${txtFiles.length} TXT letti · ${tasks.length} MP3 da generare · invio a blocchi da 25`);
+      const available = GUIDE_LANGUAGES.filter((language) => tasks.some((task) => task.languageId === language.id)).map((language) => language.id);
+      folderTasksRef.current = tasks;
+      setFolderAvailableLanguages(available);
+      setFolderSelectedLanguages(available);
+      setFolderWorkflowSummary(`${txtFiles.length} TXT letti · ${available.length} lingue trovate · seleziona quelle da convertire`);
+      setProgress(100);
+      setStatus("ready");
+      setMessage("Cartella analizzata. Scegli le lingue e avvia le conversioni.");
+      if (errors.length) setGuideError(errors.slice(0, 6).join(" · ") + (errors.length > 6 ? ` · altri ${errors.length - 6} avvisi` : ""));
+    } catch (error) {
+      if ((error as Error).name === "AbortError") {
+        setMessage("Analisi della cartella annullata.");
+        setStatus("idle");
+      } else {
+        setMessage((error as Error).message);
+        setStatus("error");
+      }
+    } finally {
+      abortRef.current = null;
+    }
+  }
 
-      let submitted = 0;
-      let skipped = 0;
+  async function startFolderWorkflow() {
+    const selected = new Set(folderSelectedLanguages);
+    const firstVoiceIndex = Math.max(0, VOICES.findIndex(([name]) => name === voice));
+    const tasks = folderTasksRef.current
+      .filter((task) => selected.has(task.languageId))
+      .map((task, index) => ({ ...task, voice: VOICES[(firstVoiceIndex + index) % VOICES.length][0] }));
+    if (!tasks.length) {
+      setMessage("Seleziona almeno una lingua da convertire.");
+      setStatus("error");
+      return;
+    }
+
+    setStatus("working");
+    setProgress(0);
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const jobStyle = customStyle.trim() || style;
+    let submitted = 0;
+    let skipped = 0;
+    let submittedInBlock = 0;
+
+    try {
       for (let index = 0; index < tasks.length; index++) {
         const task = tasks[index];
         const sourceKey = JSON.stringify(["folder-workflow-v1", task.sourceId, task.languageId, task.voice, jobStyle]);
@@ -829,17 +886,22 @@ export default function Home() {
         batchJobsRef.current = [...batchJobsRef.current, job];
         setBatchJobs(batchJobsRef.current);
         submitted++;
+        submittedInBlock++;
         setProgress(Math.round(((index + 1) / tasks.length) * 100));
 
-        if ((index + 1) % 25 === 0 && index + 1 < tasks.length) {
+        if (submittedInBlock === 25 && index + 1 < tasks.length) {
           setMessage(`Blocco da 25 inviato. Pausa di 60 secondi prima del prossimo blocco…`);
           await waitWithAbort(60000, controller.signal);
+          submittedInBlock = 0;
         }
       }
 
       setStatus("ready");
       setMessage(`${submitted} job inviati${skipped ? `, ${skipped} già presenti` : ""}. Gli MP3 saranno salvati nella cartella scelta, divisi per lingua.`);
-      if (errors.length) setGuideError(errors.slice(0, 6).join(" · ") + (errors.length > 6 ? ` · altri ${errors.length - 6} avvisi` : ""));
+      setFolderWorkflowSummary(`${submitted} job inviati per ${folderSelectedLanguages.length} ${folderSelectedLanguages.length === 1 ? "lingua" : "lingue"}.`);
+      folderTasksRef.current = [];
+      setFolderAvailableLanguages([]);
+      setFolderSelectedLanguages([]);
     } catch (error) {
       if ((error as Error).name === "AbortError") {
         setMessage("Flusso cartella interrotto. I job già confermati continueranno sui server Google.");
@@ -1132,12 +1194,40 @@ export default function Home() {
           <label className="fileButton" htmlFor="guide-file">{guideFiles.length ? "Aggiungi altri TXT" : "Scegli file TXT"}</label>
           <input id="guide-file" className="fileInput" type="file" multiple accept=".txt,text/plain" onChange={(event) => { loadGuideFiles(event.target.files); event.target.value = ""; }} disabled={status === "working"} />
           <label className="fileButton secondary" htmlFor="guide-folder">Scegli cartella</label>
-          <input id="guide-folder" className="fileInput" type="file" multiple accept=".txt,text/plain" {...folderInputProps} onChange={(event) => { submitFolderWorkflow(event.target.files); event.target.value = ""; }} disabled={status === "working"} />
+          <input id="guide-folder" className="fileInput" type="file" multiple accept=".txt,text/plain" {...folderInputProps} onChange={(event) => { prepareFolderWorkflow(event.target.files); event.target.value = ""; }} disabled={status === "working"} />
           {guideFiles.length > 0 && <select aria-label="Lingua delle audioguide" value={guideLanguage} onChange={(event) => chooseGuideLanguage(event.target.value)} disabled={status === "working" || !commonGuideLanguages.length}>
             {commonGuideLanguages.map((language) => <option key={language.id} value={language.id}>{language.label} · _{language.suffix}</option>)}
           </select>}
         </div>
         {folderWorkflowSummary && <p className="fileStatus">{folderWorkflowSummary}</p>}
+        {folderAvailableLanguages.length > 0 && <div className="folderLanguagePicker">
+          <div className="folderLanguageHeader">
+            <div><strong>Lingue da convertire</strong><span>Seleziona soltanto quelle che vuoi inviare a Gemini.</span></div>
+            <div>
+              <button type="button" onClick={() => setFolderSelectedLanguages(folderAvailableLanguages)} disabled={status === "working"}>Tutte</button>
+              <button type="button" onClick={() => setFolderSelectedLanguages([])} disabled={status === "working"}>Nessuna</button>
+            </div>
+          </div>
+          <div className="folderLanguageGrid">
+            {GUIDE_LANGUAGES.filter((language) => folderAvailableLanguages.includes(language.id)).map((language) => (
+              <label className={folderSelectedLanguages.includes(language.id) ? "selected" : ""} key={language.id}>
+                <input
+                  type="checkbox"
+                  checked={folderSelectedLanguages.includes(language.id)}
+                  onChange={() => toggleFolderLanguage(language.id)}
+                  disabled={status === "working"}
+                />
+                <span>{language.label}<small>_{language.suffix}</small></span>
+              </label>
+            ))}
+          </div>
+          <div className="folderLanguageFooter">
+            <span>{folderSelectedLanguages.length} {folderSelectedLanguages.length === 1 ? "lingua selezionata" : "lingue selezionate"} · {selectedFolderTaskCount} MP3</span>
+            <button type="button" className="startFolderBatch" onClick={startFolderWorkflow} disabled={status === "working" || !selectedFolderTaskCount}>
+              Avvia {selectedFolderTaskCount} {selectedFolderTaskCount === 1 ? "conversione" : "conversioni"} →
+            </button>
+          </div>
+        </div>}
         {guideFiles.length > 0 && <div className="queue">
           <div className="queueHeader"><strong>Coda di generazione</strong><span>{guideFiles.length} {guideFiles.length === 1 ? "file" : "file"}</span></div>
           {guideFiles.map((file, index) => {
