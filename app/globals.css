@@ -48,6 +48,9 @@ h1 em { font-family:"Playfair Display",serif; font-weight:600; color:var(--rust)
 .folderLanguageGrid input { width:auto; margin:0; accent-color:var(--rust); }
 .folderLanguageGrid span { display:flex; justify-content:space-between; align-items:center; flex:1; gap:6px; }
 .folderLanguageGrid small { opacity:.65; font-size:9px; }
+.folderOutputRequirement { display:flex; align-items:center; justify-content:space-between; gap:16px; margin:-2px 0 14px; border:1px solid #9a3023; background:#f8dfda; color:#7d261c; padding:10px 12px; font-size:10px; }
+.folderOutputRequirement button { flex:0 0 auto; border:1px solid currentColor; background:transparent; color:inherit; padding:7px 9px; cursor:pointer; font-size:9px; font-weight:600; }
+.folderOutputRequirement.warning { border-color:#866b14; background:#fff0bb; color:#6c5409; }
 .startFolderBatch { border:0; background:var(--rust); color:white; padding:11px 14px; cursor:pointer; font-size:11px; font-weight:600; }
 .startFolderBatch:disabled { opacity:.35; cursor:not-allowed; }
 .queue { grid-column:1/-1; border-top:1px solid rgba(23,23,20,.24); padding-top:14px; }
@@ -165,6 +168,8 @@ footer { display:flex; justify-content:space-between; padding:32px 0; color:#777
   .folderLanguageHeader,.folderLanguageFooter { align-items:stretch; flex-direction:column; }
   .folderLanguageHeader>div:last-child { align-self:flex-start; }
   .folderLanguageGrid { grid-template-columns:1fr 1fr; }
+  .folderOutputRequirement { align-items:stretch; flex-direction:column; }
+  .folderOutputRequirement button { width:100%; }
   .startFolderBatch { width:100%; }
   .queue { margin-top:18px; }
   .queuePreview { grid-template-columns:28px minmax(0,1fr); }

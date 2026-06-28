@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { GUIDE_LANGUAGES } from "../../../lib/audioguide";
 
 export const runtime = "nodejs";
-export const maxDuration = 120;
+export const maxDuration = 300;
 
 const VALID_VOICES = new Set(["Kore", "Achernar", "Aoede", "Charon", "Gacrux", "Iapetus", "Sulafat", "Schedar", "Achird"]);
 const TERMINAL_STATES = new Set(["JOB_STATE_SUCCEEDED", "JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"]);

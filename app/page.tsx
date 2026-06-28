@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState, type InputHTMLAttributes } from "react";
 import { Mp3Encoder } from "@breezystack/lamejs";
 import { GUIDE_LANGUAGES, parseAudioguide, stripParagraphTitles, type GuideSection } from "../lib/audioguide";
+import { readApiPayload, type ApiPayload } from "../lib/http-response";
 
 const VOICES = [
   ["Kore", "Decisa"], ["Achernar", "Morbida"], ["Aoede", "Ariose"],
@@ -253,6 +254,34 @@ async function requestAudioChunk(
     throw new Error(data.error || "La generazione non è riuscita.");
   }
   throw new Error("Gemini è ancora occupato dopo i tentativi automatici. La coda può essere ripresa senza perdere le parti completate.");
+}
+
+async function createBatchJob(
+  payload: { displayName: string; voice: string; language: string; style: string; chunks: string[] },
+  signal: AbortSignal,
+): Promise<ApiPayload & { name: string }> {
+  let lastError = new Error("Invio Batch non riuscito.");
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const response = await fetch("/api/batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal,
+      });
+      const data = await readApiPayload(response, "Invio Batch non riuscito");
+      if (response.ok && data.name) return { ...data, name: data.name };
+      lastError = new Error(data.error || `Invio Batch non riuscito (HTTP ${response.status}).`);
+      const retryable = response.status === 429 || response.status >= 500;
+      if (!retryable || attempt === 2) break;
+    } catch (error) {
+      if ((error as Error).name === "AbortError") throw error;
+      lastError = error instanceof Error ? error : lastError;
+      if (attempt === 2) break;
+    }
+    await waitWithAbort((attempt + 1) * 2500, signal);
+  }
+  throw lastError;
 }
 
 export default function Home() {
@@ -542,24 +571,28 @@ export default function Home() {
   }
 
   async function refreshBatchJobs() {
-    if (refreshingBatchRef.current) return;
+    if (refreshingBatchRef.current || abortRef.current) return;
     const active = batchJobsRef.current.filter((job) => !BATCH_TERMINAL_STATES.has(job.state));
     if (!active.length) return;
     refreshingBatchRef.current = true;
     const jobsToSave: LocalBatchJob[] = [];
     try {
-      const updates = await Promise.all(active.map(async (job) => {
-        try {
-          const response = await fetch(`/api/batch?name=${encodeURIComponent(job.name)}`, { cache: "no-store" });
-          const data = await response.json();
-          if (!response.ok) throw new Error(data.error || "Stato non disponibile");
-          const updated = { ...job, state: data.state ?? job.state, error: data.error || undefined };
-          if (updated.state === "JOB_STATE_SUCCEEDED" && !updated.savedAt && !updated.saveError && outputDirectoryRef.current) jobsToSave.push(updated);
-          return updated;
-        } catch (error) {
-          return { ...job, error: (error as Error).message };
-        }
-      }));
+      const updates: LocalBatchJob[] = [];
+      for (let offset = 0; offset < active.length; offset += 5) {
+        const group = await Promise.all(active.slice(offset, offset + 5).map(async (job) => {
+          try {
+            const response = await fetch(`/api/batch?name=${encodeURIComponent(job.name)}`, { cache: "no-store" });
+            const data = await readApiPayload(response, "Stato Batch non disponibile");
+            if (!response.ok) throw new Error(data.error || "Stato non disponibile");
+            const updated = { ...job, state: data.state ?? job.state, error: data.error || undefined };
+            if (updated.state === "JOB_STATE_SUCCEEDED" && !updated.savedAt && !updated.saveError && outputDirectoryRef.current) jobsToSave.push(updated);
+            return updated;
+          } catch (error) {
+            return { ...job, error: (error as Error).message };
+          }
+        }));
+        updates.push(...group);
+      }
       const byId = new Map(updates.map((job) => [job.localId, job]));
       setBatchJobs((current) => current.map((job) => byId.get(job.localId) ?? job));
       enqueueBatchSaves(jobsToSave);
@@ -611,7 +644,7 @@ export default function Home() {
         })
       : await fetch(`/api/batch?name=${encodeURIComponent(job.name)}&download=1&fileName=${encodeURIComponent(job.fileName)}`);
     if (!response.ok) {
-      const data = await response.json().catch(() => ({}));
+      const data = await readApiPayload(response, "Preparazione MP3 non riuscita");
       throw new Error(data.error || "Preparazione MP3 non riuscita.");
     }
     return {
@@ -694,20 +727,13 @@ export default function Home() {
         }
 
         setMessage(`Invio job ${index + 1}/${guideFiles.length}: ${file.name}`);
-        const response = await fetch("/api/batch", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            displayName: fileName,
-            voice: assignedVoice,
-            language: guideLanguage,
-            style: jobStyle,
-            chunks: jobChunks,
-          }),
-          signal: controller.signal,
-        });
-        const data = await response.json();
-        if (!response.ok || !data.name) throw new Error(data.error || `Invio fallito per ${file.name}`);
+        const data = await createBatchJob({
+          displayName: fileName,
+          voice: assignedVoice,
+          language: guideLanguage,
+          style: jobStyle,
+          chunks: jobChunks,
+        }, controller.signal);
         const job: LocalBatchJob = {
           localId: `${data.name}-${Date.now()}`,
           sourceKey,
@@ -835,15 +861,22 @@ export default function Home() {
       setStatus("error");
       return;
     }
+    if (directorySavingSupported && !outputDirectoryRef.current) {
+      setMessage("Prima scegli la cartella MP3: è diversa dalla cartella TXT che hai caricato.");
+      setStatus("error");
+      return;
+    }
 
     setStatus("working");
     setProgress(0);
+    setGuideError("");
     const controller = new AbortController();
     abortRef.current = controller;
     const jobStyle = customStyle.trim() || style;
     let submitted = 0;
     let skipped = 0;
     let submittedInBlock = 0;
+    const failed: string[] = [];
 
     try {
       for (let index = 0; index < tasks.length; index++) {
@@ -856,37 +889,36 @@ export default function Home() {
         }
 
         setMessage(`Invio ${index + 1}/${tasks.length}: ${task.sourceName} · _${task.suffix}`);
-        const response = await fetch("/api/batch", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
+        try {
+          const data = await createBatchJob({
             displayName: task.fileName,
             voice: task.voice,
             language: task.languageId,
             style: jobStyle,
             chunks: task.chunks,
-          }),
-          signal: controller.signal,
-        });
-        const data = await response.json();
-        if (!response.ok || !data.name) throw new Error(data.error || `Invio fallito per ${task.sourceName} · _${task.suffix}`);
-        const job: LocalBatchJob = {
-          localId: `${data.name}-${Date.now()}`,
-          sourceKey,
-          name: data.name,
-          fileName: task.fileName,
-          voice: task.voice,
-          state: data.state ?? "JOB_STATE_PENDING",
-          createdAt: data.createTime ?? new Date().toISOString(),
-          chunks: task.chunks,
-          language: task.languageId,
-          style: jobStyle,
-          outputSubdir: task.outputSubdir,
-        };
-        batchJobsRef.current = [...batchJobsRef.current, job];
-        setBatchJobs(batchJobsRef.current);
-        submitted++;
-        submittedInBlock++;
+          }, controller.signal);
+          const job: LocalBatchJob = {
+            localId: `${data.name}-${Date.now()}`,
+            sourceKey,
+            name: data.name!,
+            fileName: task.fileName,
+            voice: task.voice,
+            state: data.state ?? "JOB_STATE_PENDING",
+            createdAt: data.createTime ?? new Date().toISOString(),
+            chunks: task.chunks,
+            language: task.languageId,
+            style: jobStyle,
+            outputSubdir: task.outputSubdir,
+          };
+          batchJobsRef.current = [...batchJobsRef.current, job];
+          setBatchJobs(batchJobsRef.current);
+          submitted++;
+          submittedInBlock++;
+        } catch (error) {
+          if ((error as Error).name === "AbortError") throw error;
+          failed.push(`${task.sourceName} · _${task.suffix}: ${(error as Error).message}`);
+          setMessage(`Errore su ${task.fileName}; continuo con il file successivo…`);
+        }
         setProgress(Math.round(((index + 1) / tasks.length) * 100));
 
         if (submittedInBlock === 25 && index + 1 < tasks.length) {
@@ -896,12 +928,19 @@ export default function Home() {
         }
       }
 
-      setStatus("ready");
-      setMessage(`${submitted} job inviati${skipped ? `, ${skipped} già presenti` : ""}. Gli MP3 saranno salvati nella cartella scelta, divisi per lingua.`);
-      setFolderWorkflowSummary(`${submitted} job inviati per ${folderSelectedLanguages.length} ${folderSelectedLanguages.length === 1 ? "lingua" : "lingue"}.`);
-      folderTasksRef.current = [];
-      setFolderAvailableLanguages([]);
-      setFolderSelectedLanguages([]);
+      if (failed.length) {
+        setStatus("error");
+        setMessage(`${submitted} job inviati, ${failed.length} non inviati dopo i tentativi automatici. Premi di nuovo “Avvia” per riprovare soltanto quelli mancanti.`);
+        setFolderWorkflowSummary(`${submitted} inviati · ${skipped} già presenti · ${failed.length} da riprovare`);
+        setGuideError(failed.slice(0, 5).join(" · ") + (failed.length > 5 ? ` · altri ${failed.length - 5} errori` : ""));
+      } else {
+        setStatus("ready");
+        setMessage(`${submitted} job inviati${skipped ? `, ${skipped} già presenti` : ""}. Gli MP3 saranno salvati nella cartella scelta, divisi per lingua.`);
+        setFolderWorkflowSummary(`${submitted} job inviati per ${folderSelectedLanguages.length} ${folderSelectedLanguages.length === 1 ? "lingua" : "lingue"}.`);
+        folderTasksRef.current = [];
+        setFolderAvailableLanguages([]);
+        setFolderSelectedLanguages([]);
+      }
     } catch (error) {
       if ((error as Error).name === "AbortError") {
         setMessage("Flusso cartella interrotto. I job già confermati continueranno sui server Google.");
@@ -934,20 +973,13 @@ export default function Home() {
         setMessage("Questo testo è già presente nei job Batch.");
         return;
       }
-      const response = await fetch("/api/batch", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          displayName: fileName,
-          voice,
-          language: "",
-          style: jobStyle,
-          chunks: jobChunks,
-        }),
-        signal: controller.signal,
-      });
-      const data = await response.json();
-      if (!response.ok || !data.name) throw new Error(data.error || "Invio Batch fallito.");
+      const data = await createBatchJob({
+        displayName: fileName,
+        voice,
+        language: "",
+        style: jobStyle,
+        chunks: jobChunks,
+      }, controller.signal);
       const job: LocalBatchJob = {
         localId: `${data.name}-${Date.now()}`,
         sourceKey,
@@ -1007,7 +1039,7 @@ export default function Home() {
     if (!BATCH_TERMINAL_STATES.has(job.state)) {
       const response = await fetch(`/api/batch?name=${encodeURIComponent(job.name)}`, { method: "DELETE" });
       if (!response.ok) {
-        const data = await response.json().catch(() => ({}));
+        const data = await readApiPayload(response, "Annullamento non riuscito");
         setMessage(data.error || "Annullamento non riuscito.");
         setStatus("error");
         return;
@@ -1221,9 +1253,16 @@ export default function Home() {
               </label>
             ))}
           </div>
+          {directorySavingSupported && !outputDirectoryName && <div className="folderOutputRequirement">
+            <span><strong>Cartella MP3 non selezionata.</strong> La cartella dei TXT è soltanto la sorgente; scegli separatamente dove salvare gli audio.</span>
+            <button type="button" onClick={chooseOutputDirectory}>Scegli cartella MP3</button>
+          </div>}
+          {!directorySavingSupported && <div className="folderOutputRequirement warning">
+            <span>Questo browser non consente il salvataggio automatico in una cartella: gli MP3 dovranno essere scaricati manualmente. Usa Chrome o Edge per automatizzarlo.</span>
+          </div>}
           <div className="folderLanguageFooter">
             <span>{folderSelectedLanguages.length} {folderSelectedLanguages.length === 1 ? "lingua selezionata" : "lingue selezionate"} · {selectedFolderTaskCount} MP3</span>
-            <button type="button" className="startFolderBatch" onClick={startFolderWorkflow} disabled={status === "working" || !selectedFolderTaskCount}>
+            <button type="button" className="startFolderBatch" onClick={startFolderWorkflow} disabled={status === "working" || !selectedFolderTaskCount || (directorySavingSupported && !outputDirectoryName)}>
               Avvia {selectedFolderTaskCount} {selectedFolderTaskCount === 1 ? "conversione" : "conversioni"} →
             </button>
           </div>
