@@ -231,6 +231,13 @@ function waitWithAbort(milliseconds: number, signal: AbortSignal) {
   });
 }
 
+async function waitCountdownWithAbort(seconds: number, signal: AbortSignal, onTick: (remaining: number) => void) {
+  for (let remaining = seconds; remaining > 0; remaining--) {
+    onTick(remaining);
+    await waitWithAbort(1000, signal);
+  }
+}
+
 async function requestAudioChunk(
   payload: { text: string; voice: string; style: string; language?: string },
   signal: AbortSignal,
@@ -659,22 +666,102 @@ export default function Home() {
     try {
       const result = await fetchBatchResult(job);
       const saved = await saveBlobToComputer(result.blob, job.fileName, job.outputSubdir);
-      setBatchJobs((current) => current.map((item) => item.localId === job.localId ? {
+      const saveWarning = result.repairedSegments ? `${result.repairedSegments} ${result.repairedSegments === 1 ? "segmento rigenerato" : "segmenti rigenerati"} perché Gemini non aveva restituito audio.` : undefined;
+      batchJobsRef.current = batchJobsRef.current.map((item) => item.localId === job.localId ? {
         ...item,
         savedAt: saved.savedAt,
         savedPath: saved.path,
         saveError: undefined,
-        saveWarning: result.repairedSegments ? `${result.repairedSegments} ${result.repairedSegments === 1 ? "segmento rigenerato" : "segmenti rigenerati"} perché Gemini non aveva restituito audio.` : undefined,
-      } : item));
+        saveWarning,
+      } : item);
+      setBatchJobs(batchJobsRef.current);
       return true;
     } catch (error) {
-      setBatchJobs((current) => current.map((item) => item.localId === job.localId ? {
+      batchJobsRef.current = batchJobsRef.current.map((item) => item.localId === job.localId ? {
         ...item,
         saveError: (error as Error).message,
-      } : item));
+      } : item);
+      setBatchJobs(batchJobsRef.current);
       return false;
     } finally {
       savingBatchRef.current.delete(job.localId);
+    }
+  }
+
+  function mergeBatchJobUpdates(updates: LocalBatchJob[]) {
+    const byId = new Map(updates.map((job) => [job.localId, job]));
+    batchJobsRef.current = batchJobsRef.current.map((job) => byId.get(job.localId) ?? job);
+    setBatchJobs(batchJobsRef.current);
+  }
+
+  async function waitForFolderBlock(
+    jobs: LocalBatchJob[],
+    blockNumber: number,
+    totalBlocks: number,
+    signal: AbortSignal,
+    onSaved: (saved: number) => void,
+  ) {
+    const blockIds = new Set(jobs.map((job) => job.localId));
+    const saveAttempts = new Map<string, number>();
+
+    while (true) {
+      if (signal.aborted) throw new DOMException("Operazione annullata", "AbortError");
+      let current = batchJobsRef.current.filter((job) => blockIds.has(job.localId));
+      const statusUpdates: LocalBatchJob[] = [];
+      const pending = current.filter((job) => !job.savedAt && !BATCH_TERMINAL_STATES.has(job.state));
+
+      for (let offset = 0; offset < pending.length; offset += 5) {
+        const group = await Promise.all(pending.slice(offset, offset + 5).map(async (job) => {
+          try {
+            const response = await fetch(`/api/batch?name=${encodeURIComponent(job.name)}`, {
+              cache: "no-store",
+              signal,
+            });
+            const data = await readApiPayload(response, "Stato Batch non disponibile");
+            if (!response.ok) throw new Error(data.error || "Stato non disponibile");
+            return { ...job, state: data.state ?? job.state, error: data.error || undefined };
+          } catch (error) {
+            if ((error as Error).name === "AbortError") throw error;
+            return { ...job, error: (error as Error).message };
+          }
+        }));
+        statusUpdates.push(...group);
+      }
+      if (statusUpdates.length) mergeBatchJobUpdates(statusUpdates);
+
+      current = batchJobsRef.current.filter((job) => blockIds.has(job.localId));
+      const failedJob = current.find((job) =>
+        ["JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"].includes(job.state),
+      );
+
+      const readyToSave = current.filter((job) => job.state === "JOB_STATE_SUCCEEDED" && !job.savedAt);
+      for (let index = 0; index < readyToSave.length; index++) {
+        const job = readyToSave[index];
+        setMessage(`Blocco ${blockNumber}/${totalBlocks} · salvo MP3 ${index + 1}/${readyToSave.length}: ${job.fileName}`);
+        const saved = await saveBatchResult(job);
+        if (!saved) {
+          const attempts = (saveAttempts.get(job.localId) ?? 0) + 1;
+          saveAttempts.set(job.localId, attempts);
+          const latest = batchJobsRef.current.find((item) => item.localId === job.localId);
+          if (attempts >= 3 || /cartella|autorizz/i.test(latest?.saveError ?? "")) {
+            throw new Error(`${job.fileName}: ${latest?.saveError || "salvataggio non riuscito"}`);
+          }
+          await waitWithAbort(attempts * 2000, signal);
+        }
+      }
+
+      current = batchJobsRef.current.filter((job) => blockIds.has(job.localId));
+      const savedCount = current.filter((job) => job.savedAt).length;
+      onSaved(savedCount);
+      if (failedJob) {
+        throw new Error(`${failedJob.fileName}: il job è ${batchStateLabel(failedJob.state).toLocaleLowerCase()}. Gli altri MP3 pronti del blocco sono stati comunque salvati.`);
+      }
+      if (savedCount === jobs.length) return;
+
+      const succeeded = current.filter((job) => job.state === "JOB_STATE_SUCCEEDED").length;
+      const running = current.length - succeeded;
+      setMessage(`Blocco ${blockNumber}/${totalBlocks} · ${savedCount}/${jobs.length} MP3 salvati · ${running} job ancora in elaborazione`);
+      await waitWithAbort(30000, signal);
     }
   }
 
@@ -832,7 +919,7 @@ export default function Home() {
       folderTasksRef.current = tasks;
       setFolderAvailableLanguages(available);
       setFolderSelectedLanguages(available);
-      setFolderWorkflowSummary(`${txtFiles.length} TXT letti · ${available.length} lingue trovate · seleziona quelle da convertire`);
+      setFolderWorkflowSummary(`${txtFiles.length} TXT letti · ${available.length} lingue trovate · blocchi da 50 MP3`);
       setProgress(100);
       setStatus("ready");
       setMessage("Cartella analizzata. Scegli le lingue e avvia le conversioni.");
@@ -873,58 +960,84 @@ export default function Home() {
     const controller = new AbortController();
     abortRef.current = controller;
     const jobStyle = customStyle.trim() || style;
+    const blockSize = 50;
+    const totalBlocks = Math.ceil(tasks.length / blockSize);
     let submitted = 0;
     let skipped = 0;
-    let submittedInBlock = 0;
     const failed: string[] = [];
 
     try {
-      for (let index = 0; index < tasks.length; index++) {
-        const task = tasks[index];
-        const sourceKey = JSON.stringify(["folder-workflow-v1", task.sourceId, task.languageId, task.voice, jobStyle]);
-        if (batchJobsRef.current.some((job) => job.sourceKey === sourceKey && !["JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"].includes(job.state))) {
-          skipped++;
-          setProgress(Math.round(((index + 1) / tasks.length) * 100));
-          continue;
+      for (let blockIndex = 0; blockIndex < totalBlocks; blockIndex++) {
+        const blockStart = blockIndex * blockSize;
+        const blockTasks = tasks.slice(blockStart, blockStart + blockSize);
+        const blockJobs: LocalBatchJob[] = [];
+        const blockFailures: string[] = [];
+
+        for (let taskIndex = 0; taskIndex < blockTasks.length; taskIndex++) {
+          const task = blockTasks[taskIndex];
+          const sourceKey = JSON.stringify(["folder-workflow-v1", task.sourceId, task.languageId, task.voice, jobStyle]);
+          const existing = batchJobsRef.current.find((job) =>
+            job.sourceKey === sourceKey && !["JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"].includes(job.state),
+          );
+          if (existing) {
+            skipped++;
+            blockJobs.push(existing);
+            continue;
+          }
+
+          setMessage(`Blocco ${blockIndex + 1}/${totalBlocks} · invio ${taskIndex + 1}/${blockTasks.length}: ${task.fileName}`);
+          try {
+            const data = await createBatchJob({
+              displayName: task.fileName,
+              voice: task.voice,
+              language: task.languageId,
+              style: jobStyle,
+              chunks: task.chunks,
+            }, controller.signal);
+            const job: LocalBatchJob = {
+              localId: `${data.name}-${Date.now()}`,
+              sourceKey,
+              name: data.name,
+              fileName: task.fileName,
+              voice: task.voice,
+              state: data.state ?? "JOB_STATE_PENDING",
+              createdAt: data.createTime ?? new Date().toISOString(),
+              chunks: task.chunks,
+              language: task.languageId,
+              style: jobStyle,
+              outputSubdir: task.outputSubdir,
+            };
+            batchJobsRef.current = [...batchJobsRef.current, job];
+            setBatchJobs(batchJobsRef.current);
+            blockJobs.push(job);
+            submitted++;
+          } catch (error) {
+            if ((error as Error).name === "AbortError") throw error;
+            blockFailures.push(`${task.sourceName} · _${task.suffix}: ${(error as Error).message}`);
+            setMessage(`Errore su ${task.fileName}; continuo l’invio del blocco…`);
+          }
         }
 
-        setMessage(`Invio ${index + 1}/${tasks.length}: ${task.sourceName} · _${task.suffix}`);
-        try {
-          const data = await createBatchJob({
-            displayName: task.fileName,
-            voice: task.voice,
-            language: task.languageId,
-            style: jobStyle,
-            chunks: task.chunks,
-          }, controller.signal);
-          const job: LocalBatchJob = {
-            localId: `${data.name}-${Date.now()}`,
-            sourceKey,
-            name: data.name!,
-            fileName: task.fileName,
-            voice: task.voice,
-            state: data.state ?? "JOB_STATE_PENDING",
-            createdAt: data.createTime ?? new Date().toISOString(),
-            chunks: task.chunks,
-            language: task.languageId,
-            style: jobStyle,
-            outputSubdir: task.outputSubdir,
-          };
-          batchJobsRef.current = [...batchJobsRef.current, job];
-          setBatchJobs(batchJobsRef.current);
-          submitted++;
-          submittedInBlock++;
-        } catch (error) {
-          if ((error as Error).name === "AbortError") throw error;
-          failed.push(`${task.sourceName} · _${task.suffix}: ${(error as Error).message}`);
-          setMessage(`Errore su ${task.fileName}; continuo con il file successivo…`);
+        if (blockJobs.length) {
+          setMessage(`Blocco ${blockIndex + 1}/${totalBlocks} inviato. Attendo elaborazione e salvataggio di ${blockJobs.length} MP3…`);
+          await waitForFolderBlock(
+            blockJobs,
+            blockIndex + 1,
+            totalBlocks,
+            controller.signal,
+            (savedInBlock) => setProgress(Math.round(((blockStart + savedInBlock) / tasks.length) * 100)),
+          );
         }
-        setProgress(Math.round(((index + 1) / tasks.length) * 100));
 
-        if (submittedInBlock === 25 && index + 1 < tasks.length) {
-          setMessage(`Blocco da 25 inviato. Pausa di 60 secondi prima del prossimo blocco…`);
-          await waitWithAbort(60000, controller.signal);
-          submittedInBlock = 0;
+        if (blockFailures.length) {
+          failed.push(...blockFailures);
+          break;
+        }
+
+        if (blockIndex + 1 < totalBlocks) {
+          await waitCountdownWithAbort(60, controller.signal, (remaining) => {
+            setMessage(`Blocco ${blockIndex + 1}/${totalBlocks} completato e salvato. Prossimo blocco tra ${remaining} secondi…`);
+          });
         }
       }
 
@@ -935,8 +1048,9 @@ export default function Home() {
         setGuideError(failed.slice(0, 5).join(" · ") + (failed.length > 5 ? ` · altri ${failed.length - 5} errori` : ""));
       } else {
         setStatus("ready");
-        setMessage(`${submitted} job inviati${skipped ? `, ${skipped} già presenti` : ""}. Gli MP3 saranno salvati nella cartella scelta, divisi per lingua.`);
-        setFolderWorkflowSummary(`${submitted} job inviati per ${folderSelectedLanguages.length} ${folderSelectedLanguages.length === 1 ? "lingua" : "lingue"}.`);
+        setProgress(100);
+        setMessage(`${tasks.length} MP3 completati e salvati${skipped ? `, ${skipped} job erano già presenti` : ""}.`);
+        setFolderWorkflowSummary(`${tasks.length} MP3 salvati per ${folderSelectedLanguages.length} ${folderSelectedLanguages.length === 1 ? "lingua" : "lingue"}.`);
         folderTasksRef.current = [];
         setFolderAvailableLanguages([]);
         setFolderSelectedLanguages([]);
@@ -1234,7 +1348,7 @@ export default function Home() {
         {folderWorkflowSummary && <p className="fileStatus">{folderWorkflowSummary}</p>}
         {folderAvailableLanguages.length > 0 && <div className="folderLanguagePicker">
           <div className="folderLanguageHeader">
-            <div><strong>Lingue da convertire</strong><span>Seleziona soltanto quelle che vuoi inviare a Gemini.</span></div>
+            <div><strong>Lingue da convertire</strong><span>Blocchi da 50: il successivo parte 60 secondi dopo che tutti gli MP3 del precedente sono stati salvati.</span></div>
             <div>
               <button type="button" onClick={() => setFolderSelectedLanguages(folderAvailableLanguages)} disabled={status === "working"}>Tutte</button>
               <button type="button" onClick={() => setFolderSelectedLanguages([])} disabled={status === "working"}>Nessuna</button>
