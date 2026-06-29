@@ -130,6 +130,8 @@ select:focus,input:focus,textarea:focus { box-shadow:inset 0 -2px var(--rust); }
 .resultRow { display:flex; justify-content:space-between; gap:12px; }
 .progress { height:4px; background:var(--cream); margin:12px 0; overflow:hidden; }
 .progress i { display:block; height:100%; background:var(--rust); transition:width .3s; }
+.retryFolderWorkflow { width:100%; border:1px solid #8f291b; background:#f8dfda; color:#7d261c; margin:8px 0 12px; padding:11px; cursor:pointer; font-size:11px; font-weight:600; }
+.retryFolderWorkflow:hover { background:#8f291b; color:white; }
 audio { width:100%; height:36px; margin:5px 0 12px; }
 .download { display:block; text-align:center; padding:11px; border:1px solid var(--ink); color:var(--ink); text-decoration:none; font-weight:600; }
 .resultFiles { display:grid; gap:6px; margin-top:12px; }

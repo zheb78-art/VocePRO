@@ -19,6 +19,13 @@ function client() {
   return new GoogleGenAI({ apiKey });
 }
 
+function isQuotaError(error: unknown) {
+  const record = error as { status?: number; code?: number; message?: string };
+  return record?.status === 429
+    || record?.code === 429
+    || /RESOURCE_EXHAUSTED|exceeded your current quota|rate.?limit/i.test(record?.message ?? "");
+}
+
 function speechPrompt(text: string, style: string, languageId: string) {
   const language = GUIDE_LANGUAGES.find((item) => item.id === languageId);
   const languageLock = language
@@ -274,6 +281,16 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     if ((error as Error).message === "MISSING_API_KEY") {
       return NextResponse.json({ error: "Configura GEMINI_API_KEY nel file .env.local." }, { status: 503 });
+    }
+    if (isQuotaError(error)) {
+      return NextResponse.json({
+        error: "Quota Batch Gemini momentaneamente esaurita. L’app completerà e salverà i job già accettati, attenderà 60 secondi e poi riproverà quelli rimasti.",
+        quotaExceeded: true,
+        retryAfter: 60,
+      }, {
+        status: 429,
+        headers: { "Retry-After": "60" },
+      });
     }
     console.error("Batch create error", error);
     return NextResponse.json({ error: (error as Error).message || "Impossibile creare il job Batch." }, { status: 502 });

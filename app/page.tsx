@@ -263,32 +263,32 @@ async function requestAudioChunk(
   throw new Error("Gemini è ancora occupato dopo i tentativi automatici. La coda può essere ripresa senza perdere le parti completate.");
 }
 
+class BatchQuotaError extends Error {
+  retryAfter: number;
+
+  constructor(message: string, retryAfter = 60) {
+    super(message);
+    this.name = "BatchQuotaError";
+    this.retryAfter = Math.max(60, retryAfter);
+  }
+}
+
 async function createBatchJob(
   payload: { displayName: string; voice: string; language: string; style: string; chunks: string[] },
   signal: AbortSignal,
 ): Promise<ApiPayload & { name: string }> {
-  let lastError = new Error("Invio Batch non riuscito.");
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const response = await fetch("/api/batch", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-        signal,
-      });
-      const data = await readApiPayload(response, "Invio Batch non riuscito");
-      if (response.ok && data.name) return { ...data, name: data.name };
-      lastError = new Error(data.error || `Invio Batch non riuscito (HTTP ${response.status}).`);
-      const retryable = response.status === 429 || response.status >= 500;
-      if (!retryable || attempt === 2) break;
-    } catch (error) {
-      if ((error as Error).name === "AbortError") throw error;
-      lastError = error instanceof Error ? error : lastError;
-      if (attempt === 2) break;
-    }
-    await waitWithAbort((attempt + 1) * 2500, signal);
+  const response = await fetch("/api/batch", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    signal,
+  });
+  const data = await readApiPayload(response, "Invio Batch non riuscito");
+  if (response.ok && data.name) return { ...data, name: data.name };
+  if (response.status === 429 || data.quotaExceeded) {
+    throw new BatchQuotaError(data.error || "Quota Batch Gemini momentaneamente esaurita.", Number(data.retryAfter) || 60);
   }
-  throw lastError;
+  throw new Error(data.error || `Invio Batch non riuscito (HTTP ${response.status}).`);
 }
 
 export default function Home() {
@@ -314,6 +314,8 @@ export default function Home() {
   const [folderWorkflowSummary, setFolderWorkflowSummary] = useState("");
   const [folderAvailableLanguages, setFolderAvailableLanguages] = useState<string[]>([]);
   const [folderSelectedLanguages, setFolderSelectedLanguages] = useState<string[]>([]);
+  const [folderRetryCount, setFolderRetryCount] = useState(0);
+  const [folderWorkflowFinished, setFolderWorkflowFinished] = useState(false);
   const [outputDirectoryName, setOutputDirectoryName] = useState("");
   const [directorySavingSupported, setDirectorySavingSupported] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
@@ -381,6 +383,8 @@ export default function Home() {
 
   useEffect(() => {
     if (!batchHydrated || !autoCleanBatch || !batchJobs.length || status === "working" || folderAvailableLanguages.length) return;
+    const containsFolderJobs = batchJobs.some((job) => job.sourceKey.includes("\"folder-workflow-v1\""));
+    if (containsFolderJobs && !folderWorkflowFinished) return;
     const allSucceededAndSaved = batchJobs.every((job) => job.state === "JOB_STATE_SUCCEEDED" && job.savedAt);
     if (!allSucceededAndSaved || savingBatchQueueRef.current || savingBatchRef.current.size) return;
     if (batchCleanupTimerRef.current) window.clearTimeout(batchCleanupTimerRef.current);
@@ -394,7 +398,7 @@ export default function Home() {
         batchCleanupTimerRef.current = null;
       }
     };
-  }, [batchJobs, batchHydrated, autoCleanBatch, status, folderAvailableLanguages.length]);
+  }, [batchJobs, batchHydrated, autoCleanBatch, status, folderAvailableLanguages.length, folderWorkflowFinished]);
 
   useEffect(() => {
     if (!batchHydrated) return;
@@ -433,6 +437,8 @@ export default function Home() {
     setFolderWorkflowSummary("");
     setFolderAvailableLanguages([]);
     setFolderSelectedLanguages([]);
+    setFolderRetryCount(0);
+    setFolderWorkflowFinished(false);
     setBatchDownloading("");
     setBatchJobs([]);
     setGuideFiles([]);
@@ -697,7 +703,6 @@ export default function Home() {
   async function waitForFolderBlock(
     jobs: LocalBatchJob[],
     blockNumber: number,
-    totalBlocks: number,
     signal: AbortSignal,
     onSaved: (saved: number) => void,
   ) {
@@ -737,7 +742,7 @@ export default function Home() {
       const readyToSave = current.filter((job) => job.state === "JOB_STATE_SUCCEEDED" && !job.savedAt);
       for (let index = 0; index < readyToSave.length; index++) {
         const job = readyToSave[index];
-        setMessage(`Blocco ${blockNumber}/${totalBlocks} · salvo MP3 ${index + 1}/${readyToSave.length}: ${job.fileName}`);
+        setMessage(`Blocco ${blockNumber} · salvo MP3 ${index + 1}/${readyToSave.length}: ${job.fileName}`);
         const saved = await saveBatchResult(job);
         if (!saved) {
           const attempts = (saveAttempts.get(job.localId) ?? 0) + 1;
@@ -760,7 +765,7 @@ export default function Home() {
 
       const succeeded = current.filter((job) => job.state === "JOB_STATE_SUCCEEDED").length;
       const running = current.length - succeeded;
-      setMessage(`Blocco ${blockNumber}/${totalBlocks} · ${savedCount}/${jobs.length} MP3 salvati · ${running} job ancora in elaborazione`);
+      setMessage(`Blocco ${blockNumber} · ${savedCount}/${jobs.length} MP3 salvati · ${running} job ancora in elaborazione`);
       await waitWithAbort(30000, signal);
     }
   }
@@ -868,6 +873,8 @@ export default function Home() {
     setFolderWorkflowSummary("");
     setFolderAvailableLanguages([]);
     setFolderSelectedLanguages([]);
+    setFolderRetryCount(0);
+    setFolderWorkflowFinished(false);
     folderTasksRef.current = [];
     const controller = new AbortController();
     abortRef.current = controller;
@@ -957,24 +964,28 @@ export default function Home() {
     setStatus("working");
     setProgress(0);
     setGuideError("");
+    setFolderRetryCount(0);
+    setFolderWorkflowFinished(false);
     const controller = new AbortController();
     abortRef.current = controller;
     const jobStyle = customStyle.trim() || style;
     const blockSize = 50;
-    const totalBlocks = Math.ceil(tasks.length / blockSize);
     let submitted = 0;
     let skipped = 0;
+    let cursor = 0;
+    let blockNumber = 1;
+    let completedTasks = 0;
+    let emptyQuotaRetries = 0;
     const failed: string[] = [];
 
     try {
-      for (let blockIndex = 0; blockIndex < totalBlocks; blockIndex++) {
-        const blockStart = blockIndex * blockSize;
-        const blockTasks = tasks.slice(blockStart, blockStart + blockSize);
+      while (cursor < tasks.length) {
         const blockJobs: LocalBatchJob[] = [];
         const blockFailures: string[] = [];
+        let quotaBoundary: BatchQuotaError | null = null;
 
-        for (let taskIndex = 0; taskIndex < blockTasks.length; taskIndex++) {
-          const task = blockTasks[taskIndex];
+        while (cursor < tasks.length && blockJobs.length < blockSize) {
+          const task = tasks[cursor];
           const sourceKey = JSON.stringify(["folder-workflow-v1", task.sourceId, task.languageId, task.voice, jobStyle]);
           const existing = batchJobsRef.current.find((job) =>
             job.sourceKey === sourceKey && !["JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"].includes(job.state),
@@ -982,10 +993,11 @@ export default function Home() {
           if (existing) {
             skipped++;
             blockJobs.push(existing);
+            cursor++;
             continue;
           }
 
-          setMessage(`Blocco ${blockIndex + 1}/${totalBlocks} · invio ${taskIndex + 1}/${blockTasks.length}: ${task.fileName}`);
+          setMessage(`Blocco ${blockNumber} · invio ${blockJobs.length + 1}/50: ${task.fileName}`);
           try {
             const data = await createBatchJob({
               displayName: task.fileName,
@@ -1011,22 +1023,28 @@ export default function Home() {
             setBatchJobs(batchJobsRef.current);
             blockJobs.push(job);
             submitted++;
+            cursor++;
           } catch (error) {
             if ((error as Error).name === "AbortError") throw error;
+            if (error instanceof BatchQuotaError) {
+              quotaBoundary = error;
+              break;
+            }
             blockFailures.push(`${task.sourceName} · _${task.suffix}: ${(error as Error).message}`);
+            cursor++;
             setMessage(`Errore su ${task.fileName}; continuo l’invio del blocco…`);
           }
         }
 
         if (blockJobs.length) {
-          setMessage(`Blocco ${blockIndex + 1}/${totalBlocks} inviato. Attendo elaborazione e salvataggio di ${blockJobs.length} MP3…`);
+          setMessage(`Blocco ${blockNumber} inviato. Attendo elaborazione e salvataggio di ${blockJobs.length} MP3…`);
           await waitForFolderBlock(
             blockJobs,
-            blockIndex + 1,
-            totalBlocks,
+            blockNumber,
             controller.signal,
-            (savedInBlock) => setProgress(Math.round(((blockStart + savedInBlock) / tasks.length) * 100)),
+            (savedInBlock) => setProgress(Math.round(((completedTasks + savedInBlock) / tasks.length) * 100)),
           );
+          completedTasks += blockJobs.length;
         }
 
         if (blockFailures.length) {
@@ -1034,20 +1052,41 @@ export default function Home() {
           break;
         }
 
-        if (blockIndex + 1 < totalBlocks) {
-          await waitCountdownWithAbort(60, controller.signal, (remaining) => {
-            setMessage(`Blocco ${blockIndex + 1}/${totalBlocks} completato e salvato. Prossimo blocco tra ${remaining} secondi…`);
+        if (quotaBoundary) {
+          if (!blockJobs.length) {
+            emptyQuotaRetries++;
+            if (emptyQuotaRetries >= 3) {
+              failed.push(`${tasks[cursor].sourceName} · _${tasks[cursor].suffix}: quota ancora esaurita dopo tre attese.`);
+              break;
+            }
+          } else {
+            emptyQuotaRetries = 0;
+          }
+          await waitCountdownWithAbort(quotaBoundary.retryAfter, controller.signal, (remaining) => {
+            setMessage(`Quota Gemini raggiunta. I ${blockJobs.length} MP3 accettati sono stati salvati; riprovo i rimanenti tra ${remaining} secondi…`);
           });
+          blockNumber++;
+          continue;
+        }
+
+        if (cursor < tasks.length) {
+          await waitCountdownWithAbort(60, controller.signal, (remaining) => {
+            setMessage(`Blocco ${blockNumber} completato e salvato. Prossimo blocco tra ${remaining} secondi…`);
+          });
+          blockNumber++;
         }
       }
 
       if (failed.length) {
         setStatus("error");
-        setMessage(`${submitted} job inviati, ${failed.length} non inviati dopo i tentativi automatici. Premi di nuovo “Avvia” per riprovare soltanto quelli mancanti.`);
+        setFolderRetryCount(failed.length);
+        setMessage(`${submitted} job inviati, ${failed.length} non inviati. Usa il pulsante qui sotto per riprovare soltanto quelli mancanti.`);
         setFolderWorkflowSummary(`${submitted} inviati · ${skipped} già presenti · ${failed.length} da riprovare`);
         setGuideError(failed.slice(0, 5).join(" · ") + (failed.length > 5 ? ` · altri ${failed.length - 5} errori` : ""));
       } else {
         setStatus("ready");
+        setFolderRetryCount(0);
+        setFolderWorkflowFinished(true);
         setProgress(100);
         setMessage(`${tasks.length} MP3 completati e salvati${skipped ? `, ${skipped} job erano già presenti` : ""}.`);
         setFolderWorkflowSummary(`${tasks.length} MP3 salvati per ${folderSelectedLanguages.length} ${folderSelectedLanguages.length === 1 ? "lingua" : "lingue"}.`);
@@ -1058,7 +1097,10 @@ export default function Home() {
     } catch (error) {
       if ((error as Error).name === "AbortError") {
         setMessage("Flusso cartella interrotto. I job già confermati continueranno sui server Google.");
-      } else setMessage((error as Error).message);
+      } else {
+        setFolderRetryCount((current) => Math.max(1, current));
+        setMessage((error as Error).message);
+      }
       setStatus("error");
     } finally {
       abortRef.current = null;
@@ -1472,6 +1514,11 @@ export default function Home() {
           {status !== "idle" && <div className={`result ${status}`}>
             <div className="resultRow"><span>{message}</span><strong>{progress}%</strong></div>
             <div className="progress"><i style={{ width: `${progress}%` }} /></div>
+            {status === "error" && folderRetryCount > 0 && folderAvailableLanguages.length > 0 && (
+              <button type="button" className="retryFolderWorkflow" onClick={startFolderWorkflow}>
+                Riprova {folderRetryCount} {folderRetryCount === 1 ? "conversione mancante" : "conversioni mancanti"} →
+              </button>
+            )}
             {audioUrl && <><audio src={audioUrl} controls /><a className="download" href={audioUrl} download="voce.mp3">Scarica MP3 ↓</a></>}
             {guideResults.length > 0 && <div className="completedHeader"><strong>{guideResults.length} {guideResults.length === 1 ? "file pronto" : "file pronti"}</strong><span>Scaricabili anche mentre la coda continua</span></div>}
             {guideResults.length > 0 && <div className="resultFiles">{guideResults.map((result) => <a href={result.url} download={result.fileName} key={result.id}><span>{result.fileName}<small>Voce {result.voice}{result.savedAt ? " · salvato" : result.saveError ? " · salvataggio non riuscito" : " · salvataggio in corso"}</small></span><strong>↓</strong></a>)}</div>}

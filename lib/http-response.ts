@@ -3,6 +3,8 @@ export type ApiPayload = {
   name?: string;
   state?: string;
   createTime?: string;
+  quotaExceeded?: boolean;
+  retryAfter?: number;
   [key: string]: unknown;
 };
 
