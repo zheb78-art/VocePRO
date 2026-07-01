@@ -13,6 +13,7 @@ nav { height:86px; display:flex; align-items:center; justify-content:space-betwe
 .outputDirectory,.logoutButton { border:1px solid var(--ink); background:transparent; padding:8px 11px; cursor:pointer; font-size:10px; }
 .outputDirectory.ready { border-color:#456c27; background:#e6f2d5; color:#365b1d; }
 .logoutButton:hover,.outputDirectory:hover { background:var(--ink); color:white; }
+.outputDirectory:disabled { opacity:.5; cursor:not-allowed; }
 .hero { padding:70px 0 58px; display:grid; grid-template-columns:1.35fr .65fr; align-items:end; gap:30px; }
 .eyebrow { grid-column:1/-1; color:var(--rust); font-size:11px; letter-spacing:.22em; font-weight:600; margin:0 0 18px; }
 h1 { font-size:clamp(48px,6.2vw,86px); line-height:.98; letter-spacing:-.055em; font-weight:500; margin:0; }

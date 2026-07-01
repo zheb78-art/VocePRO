@@ -457,20 +457,13 @@ export default function Home() {
 
   async function chooseOutputDirectory() {
     try {
-      let handle = outputDirectoryRef.current;
-      if (handle?.requestPermission) {
-        const permission = await handle.requestPermission({ mode: "readwrite" });
-        if (permission !== "granted") handle = null;
+      const picker = (window as DirectoryPickerWindow).showDirectoryPicker;
+      if (!picker) {
+        setMessage("Questo browser userà la cartella Download. Chrome o Edge permettono di scegliere una cartella specifica.");
+        setStatus("ready");
+        return;
       }
-      if (!handle) {
-        const picker = (window as DirectoryPickerWindow).showDirectoryPicker;
-        if (!picker) {
-          setMessage("Questo browser userà la cartella Download. Chrome o Edge permettono di scegliere una cartella specifica.");
-          setStatus("ready");
-          return;
-        }
-        handle = await picker({ id: "voce-mp3-output", mode: "readwrite" });
-      }
+      const handle = await picker({ id: "voce-mp3-output", mode: "readwrite" });
       outputDirectoryRef.current = handle;
       setOutputDirectoryName(handle.name);
       await rememberOutputDirectory(handle).catch(() => undefined);
@@ -1354,8 +1347,8 @@ export default function Home() {
       <nav>
         <div className="brand"><span className="mark">V</span> Voce</div>
         <div className="navActions">
-          <button type="button" className={`outputDirectory ${outputDirectoryName ? "ready" : ""}`} onClick={chooseOutputDirectory}>
-            {directorySavingSupported ? outputDirectoryName ? `Cartella: ${outputDirectoryName}` : "Scegli cartella MP3" : "Download del browser"}
+          <button type="button" className={`outputDirectory ${outputDirectoryName ? "ready" : ""}`} onClick={chooseOutputDirectory} disabled={status === "working"}>
+            {directorySavingSupported ? outputDirectoryName ? `Cambia cartella: ${outputDirectoryName}` : "Scegli cartella MP3" : "Download del browser"}
           </button>
           <span className="badge">Gemini TTS</span>
           <button type="button" className="logoutButton" onClick={logout}>Esci</button>
